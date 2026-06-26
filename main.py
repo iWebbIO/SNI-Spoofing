@@ -51,21 +51,25 @@ async def relay_main_loop(sock_1: socket.socket, sock_2: socket.socket, peer_tas
             try:
                 data = await loop.sock_recv(sock_1, 65575)
                 if not data:
-                    raise ValueError("eof")
+                    break
                 if first_prefix_data:
                     data = first_prefix_data + data
                     first_prefix_data = b""
-                sent_len = await loop.sock_sendall(sock_2, data)
-                if sent_len != len(data):
-                    raise ValueError("incomplete send")
-            except Exception:
-                sock_1.close()
-                sock_2.close()
-                peer_task.cancel()
-                return
+                await loop.sock_sendall(sock_2, data)
+            except (ConnectionResetError, OSError, asyncio.CancelledError):
+                break
     except Exception:
         traceback.print_exc()
         sys.exit("relay main loop error!")
+    finally:
+        if peer_task and not peer_task.done():
+            for sock in (sock_1, sock_2):
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+        sock_1.close()
+        sock_2.close()
 
 
 async def handle(incoming_sock: socket.socket, incoming_remote_addr):
@@ -215,7 +219,54 @@ async def main():
         asyncio.create_task(handle(incoming_sock, addr))
 
 
+def select_network_interface() -> str:
+    ips = []
+    try:
+        hostname = socket.gethostname()
+        for ip in socket.gethostbyname_ex(hostname)[2]:
+            if ip not in ips:
+                ips.append(ip)
+    except Exception:
+        pass
+
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if ip not in ips:
+                ips.append(ip)
+    except Exception:
+        pass
+
+    if "127.0.0.1" not in ips:
+        ips.append("127.0.0.1")
+
+    try:
+        default_ip = get_default_interface_ipv4(CONNECT_IP)
+        if default_ip and default_ip not in ips:
+            ips.append(default_ip)
+    except Exception:
+        pass
+
+    print("Available network interfaces:")
+    for idx, ip in enumerate(ips, 1):
+        print(f"{idx}. {ip}")
+
+    while True:
+        try:
+            choice = input(f"Select network interface (1-{len(ips)}): ").strip()
+            choice_idx = int(choice) - 1
+            if 0 <= choice_idx < len(ips):
+                selected_ip = ips[choice_idx]
+                print(f"Using network interface: {selected_ip}")
+                return selected_ip
+            else:
+                print(f"Invalid selection. Please enter a number between 1 and {len(ips)}.")
+        except ValueError:
+            print("Invalid input. Please enter a valid number.")
+
+
 if __name__ == "__main__":
+    INTERFACE_IPV4 = select_network_interface()
     w_filter = "tcp and " + "(" + "(ip.SrcAddr == " + INTERFACE_IPV4 + " and ip.DstAddr == " + CONNECT_IP + ")" + " or " + "(ip.SrcAddr == " + CONNECT_IP + " and ip.DstAddr == " + INTERFACE_IPV4 + ")" + ")"
     fake_tcp_injector = FakeTcpInjector(w_filter, fake_injective_connections)
     threading.Thread(target=fake_tcp_injector.run, args=(), daemon=True).start()
