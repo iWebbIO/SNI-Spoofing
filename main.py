@@ -6,6 +6,8 @@ import traceback
 import threading
 import json
 import ctypes
+import subprocess
+import time
 
 # from utils.proxy_protocols import parse_vless_protocol
 from utils.network_tools import get_default_interface_ipv4
@@ -261,60 +263,222 @@ def run_as_admin():
         sys.exit(1)
 
 
-def select_network_interface() -> str:
-    ips = []
+def get_adapters():
+    # Returns a list of dictionaries: [{'IPAddress': '...', 'InterfaceAlias': '...'}]
+    cmd = ["powershell", "-Command", "Get-NetIPAddress -AddressFamily IPv4 | Select-Object IPAddress, InterfaceAlias | ConvertTo-Json"]
     try:
-        hostname = socket.gethostname()
-        for ip in socket.gethostbyname_ex(hostname)[2]:
-            if ip not in ips:
-                ips.append(ip)
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        if res.stdout.strip():
+            data = json.loads(res.stdout)
+            if isinstance(data, dict):
+                return [data]
+            return data
+    except Exception:
+        pass
+    return []
+
+
+def get_real_default_interface(connect_ip="8.8.8.8") -> tuple[str, str]:
+    # Returns (InterfaceAlias, IPAddress)
+    adapters = get_adapters()
+    ip_to_name = {a['IPAddress']: a['InterfaceAlias'] for a in adapters if 'IPAddress' in a and 'InterfaceAlias' in a}
+    name_to_ips = {}
+    for a in adapters:
+        if 'IPAddress' in a and 'InterfaceAlias' in a:
+            name_to_ips.setdefault(a['InterfaceAlias'], []).append(a['IPAddress'])
+
+    def is_proxy_tun(name: str) -> bool:
+        name_lower = name.lower()
+        return any(x in name_lower for x in ["xray", "sing", "wintun", "tun", "tap", "loopback", "pseudo"])
+
+    routes = []
+    cmd = ["powershell", "-Command", "Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Select-Object NextHop, InterfaceAlias, RouteMetric | ConvertTo-Json"]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        if res.stdout.strip():
+            routes_data = json.loads(res.stdout)
+            if isinstance(routes_data, dict):
+                routes = [routes_data]
+            elif isinstance(routes_data, list):
+                routes = routes_data
     except Exception:
         pass
 
+    physical_routes = []
+    for r in routes:
+        name = r.get('InterfaceAlias', '')
+        if name and not is_proxy_tun(name):
+            physical_routes.append(r)
+
+    if physical_routes:
+        physical_routes.sort(key=lambda x: x.get('RouteMetric', 9999))
+        best_name = physical_routes[0]['InterfaceAlias']
+        ips = name_to_ips.get(best_name, [])
+        for ip in ips:
+            if not ip.startswith("169.254") and not ip.startswith("127."):
+                return best_name, ip
+
+    for name, ips in name_to_ips.items():
+        if not is_proxy_tun(name):
+            for ip in ips:
+                if not ip.startswith("169.254") and not ip.startswith("127."):
+                    return name, ip
+
     try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            ip = info[4][0]
-            if ip not in ips:
-                ips.append(ip)
+        default_ip = get_default_interface_ipv4(connect_ip)
+        if default_ip:
+            name = ip_to_name.get(default_ip, "Unknown")
+            return name, default_ip
     except Exception:
         pass
 
-    if "127.0.0.1" not in ips:
-        ips.append("127.0.0.1")
+    return "Unknown", ""
 
-    default_ip = ""
-    try:
-        default_ip = get_default_interface_ipv4(CONNECT_IP)
-        if default_ip and default_ip not in ips:
-            ips.append(default_ip)
-    except Exception:
-        pass
+
+def select_network_interface() -> tuple[str, str]:
+    adapters = get_adapters()
+    adapter_ips = {}
+    for a in adapters:
+        name = a.get('InterfaceAlias')
+        ip = a.get('IPAddress')
+        if name and ip:
+            adapter_ips.setdefault(name, []).append(ip)
+
+    # Fallback if powershell command returned nothing (e.g. not on Windows)
+    if not adapter_ips:
+        try:
+            hostname = socket.gethostname()
+            ips = socket.gethostbyname_ex(hostname)[2]
+            adapter_ips['Default Adapter'] = ips
+        except Exception:
+            pass
+
+    if 'Loopback Pseudo-Interface 1' not in adapter_ips and 'Loopback' not in adapter_ips:
+        for name in list(adapter_ips.keys()):
+            if 'loopback' in name.lower() or 'pseudo' in name.lower():
+                break
+        else:
+            adapter_ips['Loopback Pseudo-Interface 1'] = ['127.0.0.1']
+
+    default_name, default_ip = get_real_default_interface(CONNECT_IP)
 
     print("Available network interfaces:")
-    for idx, ip in enumerate(ips, 1):
-        suffix = " (Default)" if ip == default_ip else ""
-        print(f"{idx}. {ip}{suffix}")
+    names_list = list(adapter_ips.keys())
+    for idx, name in enumerate(names_list, 1):
+        ips = adapter_ips[name]
+        ip_str = ", ".join(ips)
+        is_default = " (Default)" if name == default_name else ""
+        print(f"{idx}. {name}: {ip_str}{is_default}")
 
-    default_prompt = f" [Default: {default_ip}]" if default_ip else ""
+    default_prompt = f" [Default: {default_name}]" if default_name else ""
     while True:
         try:
-            choice = input(f"Select network interface (1-{len(ips)}){default_prompt}: ").strip()
+            choice = input(f"Select network interface (1-{len(names_list)}){default_prompt}: ").strip()
             if not choice:
-                if default_ip:
-                    print(f"Using default network interface: {default_ip}")
-                    return default_ip
+                if default_name:
+                    for ip in adapter_ips.get(default_name, []):
+                        if not ip.startswith("169.254"):
+                            print(f"Using default network interface: {default_name} ({ip})")
+                            return default_name, ip
+                    ip = adapter_ips.get(default_name, [""])[0]
+                    print(f"Using default network interface: {default_name} ({ip})")
+                    return default_name, ip
                 else:
                     print("No default interface available. Please make a selection.")
                     continue
             choice_idx = int(choice) - 1
-            if 0 <= choice_idx < len(ips):
-                selected_ip = ips[choice_idx]
-                print(f"Using network interface: {selected_ip}")
-                return selected_ip
+            if 0 <= choice_idx < len(names_list):
+                selected_name = names_list[choice_idx]
+                ips = adapter_ips[selected_name]
+                selected_ip = ""
+                for ip in ips:
+                    if not ip.startswith("169.254"):
+                        selected_ip = ip
+                        break
+                if not selected_ip and ips:
+                    selected_ip = ips[0]
+                print(f"Using network interface: {selected_name} ({selected_ip})")
+                return selected_name, selected_ip
             else:
-                print(f"Invalid selection. Please enter a number between 1 and {len(ips)}.")
+                print(f"Invalid selection. Please enter a number between 1 and {len(names_list)}.")
         except ValueError:
             print("Invalid input. Please enter a valid number.")
+
+
+fake_tcp_injector = None
+injector_thread = None
+
+
+def run_injector_safe(w_filter, connections):
+    global fake_tcp_injector
+    try:
+        fake_tcp_injector = FakeTcpInjector(w_filter, connections)
+        fake_tcp_injector.run()
+    except Exception as e:
+        print(f"\n[Info] Injector stopped: {e}")
+
+
+def stop_injector():
+    global fake_tcp_injector
+    if fake_tcp_injector:
+        try:
+            fake_tcp_injector.w.close()
+        except Exception:
+            pass
+        fake_tcp_injector = None
+
+
+def start_injector(ip: str):
+    global fake_tcp_injector, injector_thread
+    w_filter = "tcp and " + "(" + "(ip.SrcAddr == " + ip + " and ip.DstAddr == " + CONNECT_IP + ")" + " or " + "(ip.SrcAddr == " + CONNECT_IP + " and ip.DstAddr == " + ip + ")" + ")"
+    print(f"\n[Info] Starting Fake TCP Injector with filter: {w_filter}")
+    injector_thread = threading.Thread(
+        target=run_injector_safe,
+        args=(w_filter, fake_injective_connections),
+        daemon=True
+    )
+    injector_thread.start()
+
+
+def monitor_adapter_loop(adapter_name: str, initial_ip: str):
+    global INTERFACE_IPV4
+    last_ip = initial_ip
+
+    if last_ip:
+        start_injector(last_ip)
+    else:
+        print(f"\n[Warning] Adapter '{adapter_name}' is currently disconnected. Waiting for it to connect...")
+
+    while True:
+        time.sleep(2)
+        current_ip = ""
+        try:
+            adapters = get_adapters()
+            for a in adapters:
+                if a.get('InterfaceAlias') == adapter_name:
+                    ip = a.get('IPAddress')
+                    if ip and not ip.startswith("169.254"):
+                        current_ip = ip
+                        break
+        except Exception:
+            pass
+
+        if last_ip and not current_ip:
+            print(f"\n[Warning] Adapter '{adapter_name}' disconnected! Pausing tunnel...")
+            stop_injector()
+            last_ip = ""
+            INTERFACE_IPV4 = ""
+
+        elif current_ip and current_ip != last_ip:
+            if not last_ip:
+                print(f"\n[Info] Adapter '{adapter_name}' connected (IP: {current_ip}). Resuming tunnel...")
+            else:
+                print(f"\n[Info] Adapter '{adapter_name}' IP changed from {last_ip} to {current_ip}. Rebinding tunnel...")
+                stop_injector()
+
+            INTERFACE_IPV4 = current_ip
+            last_ip = current_ip
+            start_injector(current_ip)
 
 
 if __name__ == "__main__":
@@ -322,10 +486,15 @@ if __name__ == "__main__":
         print("This application requires administrator privileges. Attempting to elevate...")
         run_as_admin()
 
-    INTERFACE_IPV4 = select_network_interface()
-    w_filter = "tcp and " + "(" + "(ip.SrcAddr == " + INTERFACE_IPV4 + " and ip.DstAddr == " + CONNECT_IP + ")" + " or " + "(ip.SrcAddr == " + CONNECT_IP + " and ip.DstAddr == " + INTERFACE_IPV4 + ")" + ")"
-    fake_tcp_injector = FakeTcpInjector(w_filter, fake_injective_connections)
-    threading.Thread(target=fake_tcp_injector.run, args=(), daemon=True).start()
+    INTERFACE_NAME, INTERFACE_IPV4 = select_network_interface()
+
+    # Start the adapter monitoring and rebinding loop in a daemon thread
+    threading.Thread(
+        target=monitor_adapter_loop,
+        args=(INTERFACE_NAME, INTERFACE_IPV4),
+        daemon=True
+    ).start()
+
     print("هشن شومافر تیامح دینکیم هدافتسا دازآ تنرتنیا هب یسرتسد یارب همانرب نیا زا رگا")
     print(
         "دراد امش تیامح هب زاین هک مراد رظن رد دازآ تنرتنیا هب ناریا مدرم مامت یسرتسد یارب یدایز یاه همانرب و اه هژورپ")
