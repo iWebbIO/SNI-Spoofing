@@ -5,6 +5,7 @@ import sys
 import traceback
 import threading
 import json
+import ctypes
 
 # from utils.proxy_protocols import parse_vless_protocol
 from utils.network_tools import get_default_interface_ipv4
@@ -219,6 +220,47 @@ async def main():
         asyncio.create_task(handle(incoming_sock, addr))
 
 
+def is_admin() -> bool:
+    if os.name == 'nt':
+        try:
+            return ctypes.windll.shell32.IsUserAnAdmin() != 0
+        except Exception:
+            return False
+    else:
+        try:
+            return os.getuid() == 0
+        except AttributeError:
+            return False
+
+
+def run_as_admin():
+    if os.name == 'nt':
+        try:
+            if getattr(sys, 'frozen', False):
+                # Executable mode
+                ret = ctypes.windll.shell32.ShellExecuteW(
+                    None, "runas", sys.executable, " ".join(sys.argv[1:]), None, 1
+                )
+            else:
+                # Script mode
+                script = sys.argv[0]
+                params = f'"{script}" ' + " ".join([f'"{arg}"' for arg in sys.argv[1:]])
+                ret = ctypes.windll.shell32.ShellExecuteW(
+                    None, "runas", sys.executable, params, None, 1
+                )
+            if int(ret) <= 32:
+                print("Administrator privileges were denied. Exiting.")
+                sys.exit(1)
+            else:
+                sys.exit(0)
+        except Exception as e:
+            print(f"Failed to elevate privileges: {e}")
+            sys.exit(1)
+    else:
+        print("Please run this script as root/administrator.")
+        sys.exit(1)
+
+
 def select_network_interface() -> str:
     ips = []
     try:
@@ -240,6 +282,7 @@ def select_network_interface() -> str:
     if "127.0.0.1" not in ips:
         ips.append("127.0.0.1")
 
+    default_ip = ""
     try:
         default_ip = get_default_interface_ipv4(CONNECT_IP)
         if default_ip and default_ip not in ips:
@@ -249,11 +292,20 @@ def select_network_interface() -> str:
 
     print("Available network interfaces:")
     for idx, ip in enumerate(ips, 1):
-        print(f"{idx}. {ip}")
+        suffix = " (Default)" if ip == default_ip else ""
+        print(f"{idx}. {ip}{suffix}")
 
+    default_prompt = f" [Default: {default_ip}]" if default_ip else ""
     while True:
         try:
-            choice = input(f"Select network interface (1-{len(ips)}): ").strip()
+            choice = input(f"Select network interface (1-{len(ips)}){default_prompt}: ").strip()
+            if not choice:
+                if default_ip:
+                    print(f"Using default network interface: {default_ip}")
+                    return default_ip
+                else:
+                    print("No default interface available. Please make a selection.")
+                    continue
             choice_idx = int(choice) - 1
             if 0 <= choice_idx < len(ips):
                 selected_ip = ips[choice_idx]
@@ -266,6 +318,10 @@ def select_network_interface() -> str:
 
 
 if __name__ == "__main__":
+    if not is_admin():
+        print("This application requires administrator privileges. Attempting to elevate...")
+        run_as_admin()
+
     INTERFACE_IPV4 = select_network_interface()
     w_filter = "tcp and " + "(" + "(ip.SrcAddr == " + INTERFACE_IPV4 + " and ip.DstAddr == " + CONNECT_IP + ")" + " or " + "(ip.SrcAddr == " + CONNECT_IP + " and ip.DstAddr == " + INTERFACE_IPV4 + ")" + ")"
     fake_tcp_injector = FakeTcpInjector(w_filter, fake_injective_connections)
