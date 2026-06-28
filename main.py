@@ -25,19 +25,55 @@ def get_exe_dir():
         return os.path.dirname(os.path.abspath(__file__))
 
 
-# Build the path to config.json
+# Load or create the config
 config_path = os.path.join(get_exe_dir(), 'config.json')
+if not os.path.exists(config_path):
+    default_config = {
+        "LISTEN_HOST": "0.0.0.0",
+        "LISTEN_PORT": 40443,
+        "CONNECT_IP": "188.114.99.0",
+        "CONNECT_PORT": 443,
+        "FAKE_SNI": "chatgpt.com"
+    }
+    try:
+        with open(config_path, 'w') as f:
+            json.dump(default_config, f, indent=2)
+        print(f"[Info] Created default config.json at {config_path}")
+        config = default_config
+    except Exception as e:
+        print(f"[Warning] Could not write default config.json: {e}")
+        config = default_config
+else:
+    try:
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+    except Exception as e:
+        print(f"[Error] Failed to read config.json: {e}. Using default configuration.")
+        config = {
+            "LISTEN_HOST": "0.0.0.0",
+            "LISTEN_PORT": 40443,
+            "CONNECT_IP": "188.114.99.0",
+            "CONNECT_PORT": 443,
+            "FAKE_SNI": "chatgpt.com"
+        }
 
-# Load the config
-with open(config_path, 'r') as f:
-    config = json.load(f)
-
-LISTEN_HOST = config["LISTEN_HOST"]
-LISTEN_PORT = config["LISTEN_PORT"]
-FAKE_SNI = config["FAKE_SNI"].encode()
-CONNECT_IP = config["CONNECT_IP"]
-CONNECT_PORT = config["CONNECT_PORT"]
+LISTEN_HOST = config.get("LISTEN_HOST", "0.0.0.0")
+LISTEN_PORT = config.get("LISTEN_PORT", 40443)
+FAKE_SNI = config.get("FAKE_SNI", "chatgpt.com").encode()
+CONNECT_IP = config.get("CONNECT_IP", "188.114.99.0")
+CONNECT_PORT = config.get("CONNECT_PORT", 443)
 INTERFACE_IPV4 = get_default_interface_ipv4(CONNECT_IP)
+
+
+def check_windivert_binaries():
+    """Helper to check if WinDivert binaries are present in script or workdir."""
+    if os.name == 'nt':
+        exe_dir = get_exe_dir()
+        wd_files = ["WinDivert.dll", "WinDivert64.sys"]
+        missing = [f for f in wd_files if not os.path.exists(os.path.join(exe_dir, f)) and not os.path.exists(os.path.join(os.getcwd(), f))]
+        if missing:
+            print(f"[Note] WinDivert binaries ({', '.join(missing)}) were not found in the application directory.")
+            print("       If the application fails to start packet capture, please download WinDivert and place them here.")
 DATA_MODE = "tls"
 BYPASS_METHOD = "wrong_seq"
 
@@ -76,6 +112,8 @@ async def relay_main_loop(sock_1: socket.socket, sock_2: socket.socket, peer_tas
 
 
 async def handle(incoming_sock: socket.socket, incoming_remote_addr):
+    conn_id = f"{incoming_remote_addr[0]}:{incoming_remote_addr[1]}"
+    print(f"[+] Client connected: {conn_id}")
     try:
         loop = asyncio.get_running_loop()
         # try:
@@ -119,14 +157,14 @@ async def handle(incoming_sock: socket.socket, incoming_remote_addr):
         # else:
         #     print(data)
         #     sys.exit("impossible address type!")
-
+ 
         # try:
         #     fake_sni_host, data_mode, bypass_method = UUID_FAKE_MAP[uuid_bytes]
         # except KeyError:
         #     print("unmatched uuid", uuid_bytes)
         #     incoming_sock.close()
         #     return
-
+ 
         # if data_mode == "http":
         #     ...
         if DATA_MODE == "tls":
@@ -147,58 +185,41 @@ async def handle(incoming_sock: socket.socket, incoming_remote_addr):
                                                       BYPASS_METHOD, incoming_sock)
         fake_injective_connections[fake_injective_conn.id] = fake_injective_conn
         try:
-            await loop.sock_connect(outgoing_sock, (CONNECT_IP, CONNECT_PORT))
-        except Exception:
-            fake_injective_conn.monitor = False
-            del fake_injective_connections[fake_injective_conn.id]
-            outgoing_sock.close()
-            incoming_sock.close()
-            return
-
-        # if bypass_method == "wrong_checksum":
-        #     ...
-
-        if BYPASS_METHOD == "wrong_seq":
             try:
-                await asyncio.wait_for(fake_injective_conn.t2a_event.wait(), 2)
-                if fake_injective_conn.t2a_msg == "unexpected_close":
-                    raise ValueError("unexpected close")
-                if fake_injective_conn.t2a_msg == "fake_data_ack_recv":
-                    pass
-                else:
-                    sys.exit("impossible t2a msg!")
+                await loop.sock_connect(outgoing_sock, (CONNECT_IP, CONNECT_PORT))
             except Exception:
-                fake_injective_conn.monitor = False
-                del fake_injective_connections[fake_injective_conn.id]
                 outgoing_sock.close()
                 incoming_sock.close()
                 return
-        else:
-            sys.exit("unknown bypass method!")
 
-        fake_injective_conn.monitor = False
-        del fake_injective_connections[fake_injective_conn.id]
-
-        # early_data = data[payload_index:]
-        # if early_data:
-        #     try:
-        #         sent_len = await loop.sock_sendall(outgoing_sock, early_data)
-        #         if sent_len != len(early_data):
-        #             raise ValueError("incomplete send")
-        #     except Exception:
-        #         outgoing_sock.close()
-        #         incoming_sock.close()
-        #         return
+            if BYPASS_METHOD == "wrong_seq":
+                try:
+                    await asyncio.wait_for(fake_injective_conn.t2a_event.wait(), 2)
+                    if fake_injective_conn.t2a_msg == "unexpected_close":
+                        raise ValueError("unexpected close")
+                    if fake_injective_conn.t2a_msg == "fake_data_ack_recv":
+                        pass
+                    else:
+                        sys.exit("impossible t2a msg!")
+                except Exception:
+                    outgoing_sock.close()
+                    incoming_sock.close()
+                    return
+            else:
+                sys.exit("unknown bypass method!")
+        finally:
+            fake_injective_conn.monitor = False
+            fake_injective_connections.pop(fake_injective_conn.id, None)
 
         oti_task = asyncio.create_task(
             relay_main_loop(outgoing_sock, incoming_sock, asyncio.current_task(), b""))  # bytes([version, 0])
         await relay_main_loop(incoming_sock, outgoing_sock, oti_task, b"")
-
-
-
+ 
     except Exception:
         traceback.print_exc()
         sys.exit("handle should not raise exception")
+    finally:
+        print(f"[-] Client disconnected: {conn_id}")
 
 
 async def main():
@@ -362,13 +383,30 @@ def select_network_interface() -> tuple[str, str]:
 
     default_name, default_ip = get_real_default_interface(CONNECT_IP)
 
-    print("Available network interfaces:")
+    def is_proxy_tun(n: str) -> bool:
+        n_lower = n.lower()
+        return any(x in n_lower for x in ["xray", "sing", "wintun", "tun", "tap", "loopback", "pseudo"])
+
+    print("\n==================================================")
+    print("Available Network Interfaces:")
     names_list = list(adapter_ips.keys())
     for idx, name in enumerate(names_list, 1):
         ips = adapter_ips[name]
         ip_str = ", ".join(ips)
         is_default = " (Default)" if name == default_name else ""
-        print(f"{idx}. {name}: {ip_str}{is_default}")
+        
+        # Determine label type
+        if name == default_name:
+            label = "[Physical/Active Default]"
+        elif "loopback" in name.lower() or "pseudo" in name.lower():
+            label = "[Loopback]"
+        elif is_proxy_tun(name):
+            label = "[TUN/VPN/Virtual]"
+        else:
+            label = "[Other/LAN]"
+            
+        print(f" {idx}. {name:<30} -> {ip_str:<20} {label}{is_default}")
+    print("==================================================\n")
 
     default_prompt = f" [Default: {default_name}]" if default_name else ""
     while True:
@@ -430,7 +468,12 @@ def stop_injector():
 
 def start_injector(ip: str):
     global fake_tcp_injector, injector_thread
-    w_filter = "tcp and " + "(" + "(ip.SrcAddr == " + ip + " and ip.DstAddr == " + CONNECT_IP + ")" + " or " + "(ip.SrcAddr == " + CONNECT_IP + " and ip.DstAddr == " + ip + ")" + ")"
+    w_filter = (
+        "tcp and "
+        f"((ip.SrcAddr == {ip} and ip.DstAddr == {CONNECT_IP} and tcp.DstPort == {CONNECT_PORT}) or "
+        f"(ip.SrcAddr == {CONNECT_IP} and ip.DstAddr == {ip} and tcp.SrcPort == {CONNECT_PORT})) and "
+        "(tcp.Syn or tcp.Rst or tcp.Fin or tcp.PayloadLength == 0)"
+    )
     print(f"\n[Info] Starting Fake TCP Injector with filter: {w_filter}")
     injector_thread = threading.Thread(
         target=run_injector_safe,
@@ -486,6 +529,8 @@ if __name__ == "__main__":
         print("This application requires administrator privileges. Attempting to elevate...")
         run_as_admin()
 
+    check_windivert_binaries()
+
     INTERFACE_NAME, INTERFACE_IPV4 = select_network_interface()
 
     # Start the adapter monitoring and rebinding loop in a daemon thread
@@ -501,4 +546,11 @@ if __name__ == "__main__":
     print("\n")
     print("USDT (BEP20): 0x76a768B53Ca77B43086946315f0BDF21156bF424\n")
     print("@patterniha")
-    asyncio.run(main())
+    
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[Info] KeyboardInterrupt received. Stopping services gracefully...")
+        stop_injector()
+        print("[Info] Goodbye!")
+        sys.exit(0)

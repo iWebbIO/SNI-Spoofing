@@ -3,6 +3,7 @@ import socket
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from pydivert import Packet
 
@@ -29,6 +30,7 @@ class FakeTcpInjector(TcpInjector):
     def __init__(self, w_filter: str, connections: dict[tuple, FakeInjectiveConnection]):
         super().__init__(w_filter)
         self.connections = connections
+        self.executor = ThreadPoolExecutor(max_workers=64)
 
     def fake_send_thread(self, packet: Packet, connection: FakeInjectiveConnection):
         time.sleep(0.001)
@@ -143,7 +145,7 @@ class FakeTcpInjector(TcpInjector):
 
             self.w.send(packet, False)
             connection.sch_fake_sent = True
-            threading.Thread(target=self.fake_send_thread, args=(packet, connection), daemon=True).start()
+            self.executor.submit(self.fake_send_thread, packet, connection)
             return
         self.on_unexpected_packet(packet, connection, "unexpected outbound packet")
         return
